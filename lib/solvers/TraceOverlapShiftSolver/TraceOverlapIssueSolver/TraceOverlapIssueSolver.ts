@@ -1,4 +1,5 @@
 import type { GraphicsObject } from "graphics-debug"
+import { doSegmentsIntersect } from "@tscircuit/math-utils"
 import { BaseSolver } from "lib/solvers/BaseSolver/BaseSolver"
 import type { MspConnectionPairId } from "lib/solvers/MspConnectionPairSolver/MspConnectionPairSolver"
 import type { SolvedTracePath } from "lib/solvers/SchematicTraceLinesSolver/SchematicTraceLinesSolver"
@@ -49,20 +50,52 @@ export class TraceOverlapIssueSolver extends BaseSolver {
     // Shift only the overlapping segments, and move the shared endpoints
     // (the last point of the previous segment and the first point of the next
     // segment) so the polyline remains orthogonal without self-overlap.
-    const EPS = 1e-6
+    const offsets = this.chooseOffsetsThatMinimizeCrossings()
 
-    // Compute offsets for each island involved: alternate directions
-    const offsets = this.overlappingTraceSegments.map((_, idx) => {
+    this.correctedTraceMap = this.buildCorrectedTraceMapForOffsets(offsets)
+    this.solved = true
+  }
+
+  private chooseOffsetsThatMinimizeCrossings() {
+    const candidates = this.getOffsetCandidates()
+    let bestOffsets = candidates[0]!
+    let bestScore = Number.POSITIVE_INFINITY
+
+    for (const candidate of candidates) {
+      const candidateTraceMap = this.buildCorrectedTraceMapForOffsets(candidate)
+      const score = this.countDifferentNetIntersections(candidateTraceMap)
+      if (score < bestScore) {
+        bestScore = score
+        bestOffsets = candidate
+      }
+    }
+
+    return bestOffsets
+  }
+
+  private getOffsetCandidates() {
+    const defaultOffsets = this.overlappingTraceSegments.map((_, idx) => {
       const n = Math.floor(idx / 2) + 1
       const signed = idx % 2 === 0 ? -n : n
       return signed * this.SHIFT_DISTANCE
     })
 
+    const candidates = [defaultOffsets]
+    if (defaultOffsets.length === 2) {
+      candidates.push(defaultOffsets.map((offset) => -offset))
+    }
+
+    return candidates
+  }
+
+  private buildCorrectedTraceMapForOffsets(offsets: number[]) {
+    const EPS = 1e-6
     const eq = (a: number, b: number) => Math.abs(a - b) < EPS
     const samePoint = (
       p: { x: number; y: number } | undefined,
       q: { x: number; y: number } | undefined,
     ) => !!p && !!q && eq(p.x, q.x) && eq(p.y, q.y)
+    const correctedTraceMap: Record<MspConnectionPairId, SolvedTracePath> = {}
 
     // For each net island group, shift only its overlapping segments and adjust adjacent joints
     this.overlappingTraceSegments.forEach((group, gidx) => {
@@ -79,10 +112,8 @@ export class TraceOverlapIssueSolver extends BaseSolver {
 
       for (const [pathIdx, segIdxSet] of byPath) {
         const original = this.traceNetIslands[group.connNetId][pathIdx]!
-        const current = this.correctedTraceMap[original.mspPairId] ?? original
+        const current = correctedTraceMap[original.mspPairId] ?? original
         const pts = current.tracePath.map((p) => ({ ...p }))
-
-        const segIdxs = Array.from(segIdxSet).sort((a, b) => a - b)
 
         const segIdxsRev = Array.from(segIdxSet)
           .sort((a, b) => a - b)
@@ -132,14 +163,48 @@ export class TraceOverlapIssueSolver extends BaseSolver {
           }
         }
 
-        this.correctedTraceMap[original.mspPairId] = {
+        correctedTraceMap[original.mspPairId] = {
           ...current,
           tracePath: cleaned,
         }
       }
     })
 
-    this.solved = true
+    return correctedTraceMap
+  }
+
+  private countDifferentNetIntersections(
+    candidateTraceMap: Record<MspConnectionPairId, SolvedTracePath>,
+  ) {
+    const traces = Object.values(this.traceNetIslands).flatMap((island) =>
+      island.map((trace) => candidateTraceMap[trace.mspPairId] ?? trace),
+    )
+
+    let count = 0
+    for (let i = 0; i < traces.length; i++) {
+      const traceA = traces[i]!
+      for (let j = i + 1; j < traces.length; j++) {
+        const traceB = traces[j]!
+        if (traceA.globalConnNetId === traceB.globalConnNetId) continue
+
+        for (let ai = 0; ai < traceA.tracePath.length - 1; ai++) {
+          for (let bi = 0; bi < traceB.tracePath.length - 1; bi++) {
+            if (
+              doSegmentsIntersect(
+                traceA.tracePath[ai]!,
+                traceA.tracePath[ai + 1]!,
+                traceB.tracePath[bi]!,
+                traceB.tracePath[bi + 1]!,
+              )
+            ) {
+              count++
+            }
+          }
+        }
+      }
+    }
+
+    return count
   }
 
   override visualize(): GraphicsObject {
